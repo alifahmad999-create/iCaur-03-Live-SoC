@@ -438,6 +438,18 @@
   .data-btn:last-child { margin-bottom: 0; }
   .data-btn:active { background: rgba(79,209,197,0.16); }
   .data-hint { font-size: 11.5px; color: var(--dim); line-height: 1.6; margin-top: 4px; }
+  .settings-text-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+    outline: none;
+    -webkit-appearance: none;
+    box-sizing: border-box;
+  }
   .app-modal-backdrop {
     position: fixed; inset: 0;
     background: rgba(0,0,0,0.72);
@@ -2294,6 +2306,24 @@
       <button id="restoreBtn" class="data-btn">Restore from backup</button>
       <input id="restoreFileInput" type="file" accept="application/json,.json" style="display:none;">
       <div class="data-hint">Saves all trips, calibration and settings to a file you keep in Files, iCloud Drive or Google Drive. Restore it on a new phone or if the browser clears app data.</div>
+    </div>
+
+    <div class="section-title">ABRP Live Telemetry</div>
+    <div class="settings-section">
+      <div class="settings-row toggle-row">
+        <div>
+          <div class="toggle-label">Push live SOC to ABRP</div>
+          <div class="toggle-sub">Sends SOC + GPS every ~8s while a trip is active</div>
+        </div>
+        <button class="toggle-switch" id="abrpPushToggle" role="switch" aria-checked="false"><span class="toggle-knob"></span></button>
+      </div>
+      <div style="margin-top:4px;">
+        <div style="font-size:13px;color:var(--text);margin-bottom:6px;">Worker proxy URL</div>
+        <input id="abrpProxyUrlInput" type="text" class="settings-text-input"
+           placeholder="https://your-worker.workers.dev/abrp" autocomplete="off"
+           autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="data-hint">Lets ABRP's routing use this app's accurate SOC instead of its own generic estimate. Nothing is sent until the toggle above is on and a proxy URL is saved here.</div>
     </div>
 
     <div class="section-title">About</div>
@@ -5157,6 +5187,7 @@
 
     acquireWakeLock();
     beginGpsWatch();
+    syncAbrpPushState();
   }
 
   // Accelerometer regen capture — module scope so resumeTrip() can reuse it.
@@ -5538,6 +5569,7 @@
     releaseWakeLock();
     clearTripState();
     tripActive = false;
+    syncAbrpPushState();
     bridgeActive = false;
     gpsIsLive = false;
     bridgeSpeedMs = 0;
@@ -5760,6 +5792,7 @@
     setVerifyMode(true); // restore the live-SOC verify/calibrate card on resume
     acquireWakeLock();
     beginGpsWatch();
+    syncAbrpPushState();
     render();
   }
 
@@ -7326,6 +7359,113 @@
     refreshVehicleSetupUI();
     render();
   });
+
+  // ---- ABRP live telemetry push ----
+  // Pure client-side, additive: while a trip is active, pushes
+  // { soc, speed, lat, lon, is_charging, utc } to a user-supplied Cloudflare
+  // Worker proxy (which forwards to ABRP's Telemetry API) every ~8s. Only
+  // reads tripActive/currentSocPrecise — never writes them, so this can't
+  // touch SOC calculation, buffer modeling, or calibration.
+  const ABRP_PUSH_ENABLED_KEY = 'icarAbrpPushEnabled';
+  const ABRP_PROXY_URL_KEY = 'icarAbrpProxyUrl';
+  const ABRP_PUSH_INTERVAL_MS = 8000;
+
+  function loadAbrpPushEnabled() {
+    try { return localStorage.getItem(ABRP_PUSH_ENABLED_KEY) === 'true'; } catch (e) { return false; }
+  }
+  function saveAbrpPushEnabled(enabled) {
+    try { localStorage.setItem(ABRP_PUSH_ENABLED_KEY, String(!!enabled)); } catch (e) {}
+  }
+  function loadAbrpProxyUrl() {
+    try { return (localStorage.getItem(ABRP_PROXY_URL_KEY) || '').trim(); } catch (e) { return ''; }
+  }
+  function saveAbrpProxyUrl(url) {
+    try { localStorage.setItem(ABRP_PROXY_URL_KEY, (url || '').trim()); } catch (e) {}
+  }
+
+  let abrpPushIntervalId = null;
+
+  function sendAbrpTelemetry() {
+    if (!tripActive) return;
+    const url = loadAbrpProxyUrl();
+    if (!url) return;
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          try {
+            const payload = {
+              soc: currentSocPrecise,
+              speed: (pos.coords.speed !== null && pos.coords.speed !== undefined) ? pos.coords.speed : null,
+              lat: pos.coords.latitude,
+              lon: pos.coords.longitude,
+              // No OBD2/charger signal exists in this app, and telemetry only
+              // ever runs during an active driving trip — never mid-charge.
+              is_charging: false,
+              utc: Math.floor(Date.now() / 1000),
+            };
+            fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            }).catch((e) => { console.warn('ABRP push: request failed', e); });
+          } catch (e) {
+            console.warn('ABRP push: send failed', e);
+          }
+        },
+        (err) => { console.warn('ABRP push: geolocation failed', err); },
+        { enableHighAccuracy: false, maximumAge: 10000, timeout: 5000 }
+      );
+    } catch (e) {
+      console.warn('ABRP push: unexpected error', e);
+    }
+  }
+
+  // Starts/stops the interval so it's running exactly when all three
+  // conditions hold: a trip is active, the toggle is on, and a proxy URL is
+  // saved. Called from the toggle/URL-input handlers below and from
+  // startTrip()/resumeTrip()/stopTrip(), so it can never keep running past
+  // the trip ending or the toggle being switched off mid-trip.
+  function syncAbrpPushState() {
+    const shouldRun = tripActive && loadAbrpPushEnabled() && !!loadAbrpProxyUrl();
+    if (shouldRun && abrpPushIntervalId === null) {
+      abrpPushIntervalId = setInterval(sendAbrpTelemetry, ABRP_PUSH_INTERVAL_MS);
+      sendAbrpTelemetry(); // push once immediately rather than waiting 8s for the first fix
+    } else if (!shouldRun && abrpPushIntervalId !== null) {
+      clearInterval(abrpPushIntervalId);
+      abrpPushIntervalId = null;
+    }
+  }
+
+  const abrpPushToggle = document.getElementById('abrpPushToggle');
+  const abrpProxyUrlInput = document.getElementById('abrpProxyUrlInput');
+
+  function refreshAbrpUI() {
+    const enabled = loadAbrpPushEnabled();
+    if (abrpPushToggle) {
+      abrpPushToggle.classList.toggle('on', enabled);
+      abrpPushToggle.setAttribute('aria-checked', String(enabled));
+    }
+    if (abrpProxyUrlInput) abrpProxyUrlInput.value = loadAbrpProxyUrl();
+  }
+
+  if (abrpPushToggle) {
+    abrpPushToggle.addEventListener('click', () => {
+      saveAbrpPushEnabled(!loadAbrpPushEnabled());
+      refreshAbrpUI();
+      syncAbrpPushState();
+    });
+  }
+  if (abrpProxyUrlInput) {
+    abrpProxyUrlInput.addEventListener('change', () => {
+      saveAbrpProxyUrl(abrpProxyUrlInput.value);
+      syncAbrpPushState();
+    });
+    abrpProxyUrlInput.addEventListener('blur', () => {
+      saveAbrpProxyUrl(abrpProxyUrlInput.value);
+      syncAbrpPushState();
+    });
+  }
+  refreshAbrpUI();
 
   tabButtons.forEach(btn => {
     btn.addEventListener('click', () => {

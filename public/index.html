@@ -631,6 +631,22 @@
     font-family: var(--mono);
     margin-top: 2px;
   }
+  .abrp-status {
+    font-size: 10.5px;
+    font-family: var(--mono);
+    color: var(--dim);
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-top: 6px;
+  }
+  .abrp-status .abrp-status-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .abrp-status.ok { color: var(--green); }
+  .abrp-status.failed { color: var(--red); }
   .toggle-switch {
     width: 46px;
     height: 26px;
@@ -2313,7 +2329,7 @@
       <div class="settings-row toggle-row">
         <div>
           <div class="toggle-label">Push live SOC to ABRP</div>
-          <div class="toggle-sub">Sends SOC + GPS every ~8s while a trip is active</div>
+          <div class="toggle-sub">Sends SOC + GPS every 10s while a trip is active</div>
         </div>
         <button class="toggle-switch" id="abrpPushToggle" role="switch" aria-checked="false"><span class="toggle-knob"></span></button>
       </div>
@@ -2323,6 +2339,7 @@
            placeholder="https://your-worker.workers.dev/abrp" autocomplete="off"
            autocapitalize="off" spellcheck="false">
       </div>
+      <div class="abrp-status idle" id="abrpPushStatus"><span class="abrp-status-dot"></span><span id="abrpPushStatusLabel">Idle</span></div>
       <div class="data-hint">Lets ABRP's routing use this app's accurate SOC instead of its own generic estimate. Nothing is sent until the toggle above is on and a proxy URL is saved here.</div>
     </div>
 
@@ -7362,13 +7379,15 @@
 
   // ---- ABRP live telemetry push ----
   // Pure client-side, additive: while a trip is active, pushes
-  // { soc, speed, lat, lon, is_charging, utc } to a user-supplied Cloudflare
-  // Worker proxy (which forwards to ABRP's Telemetry API) every ~8s. Only
-  // reads tripActive/currentSocPrecise — never writes them, so this can't
-  // touch SOC calculation, buffer modeling, or calibration.
+  // { utc, soc, speed, lat, lon, is_charging } to a user-supplied Cloudflare
+  // Worker proxy (which forwards to ABRP's Telemetry API) every 10s. Reads
+  // tripActive/currentSocPrecise/lastPos/smoothedSpeedKmh off the existing
+  // watchPosition stream in beginGpsWatch() — never writes them and never
+  // opens a second geolocation subscription — so this can't touch SOC
+  // calculation, buffer modeling, or calibration.
   const ABRP_PUSH_ENABLED_KEY = 'icarAbrpPushEnabled';
   const ABRP_PROXY_URL_KEY = 'icarAbrpProxyUrl';
-  const ABRP_PUSH_INTERVAL_MS = 8000;
+  const ABRP_PUSH_INTERVAL_MS = 10000;
 
   function loadAbrpPushEnabled() {
     try { return localStorage.getItem(ABRP_PUSH_ENABLED_KEY) === 'true'; } catch (e) { return false; }
@@ -7384,38 +7403,62 @@
   }
 
   let abrpPushIntervalId = null;
+  const abrpPushStatusEl = document.getElementById('abrpPushStatus');
+  const abrpPushStatusLabel = document.getElementById('abrpPushStatusLabel');
+
+  // state: 'idle' | 'ok' | 'failed'. Purely cosmetic — never affects sending.
+  function setAbrpPushStatus(state, label) {
+    if (!abrpPushStatusEl) return;
+    abrpPushStatusEl.classList.remove('idle', 'ok', 'failed');
+    abrpPushStatusEl.classList.add(state);
+    if (abrpPushStatusLabel) {
+      abrpPushStatusLabel.textContent = label || (state === 'ok' ? 'Sent' : state === 'failed' ? 'Failed' : 'Idle');
+    }
+  }
 
   function sendAbrpTelemetry() {
     if (!tripActive) return;
     const url = loadAbrpProxyUrl();
     if (!url) return;
     try {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          try {
-            const payload = {
-              soc: currentSocPrecise,
-              speed: (pos.coords.speed !== null && pos.coords.speed !== undefined) ? pos.coords.speed : null,
-              lat: pos.coords.latitude,
-              lon: pos.coords.longitude,
-              // No OBD2/charger signal exists in this app, and telemetry only
-              // ever runs during an active driving trip — never mid-charge.
-              is_charging: false,
-              utc: Math.floor(Date.now() / 1000),
-            };
-            fetch(url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload),
-            }).catch((e) => { console.warn('ABRP push: request failed', e); });
-          } catch (e) {
-            console.warn('ABRP push: send failed', e);
-          }
-        },
-        (err) => { console.warn('ABRP push: geolocation failed', err); },
-        { enableHighAccuracy: false, maximumAge: 10000, timeout: 5000 }
-      );
+      // Reuse the app's own GPS/speed state (updated by the single
+      // watchPosition subscription in beginGpsWatch()) instead of opening a
+      // second location request. Fields the app doesn't currently have a
+      // value for are omitted rather than sent as null/0.
+      const payload = { utc: Math.floor(Date.now() / 1000) };
+      if (typeof currentSocPrecise === 'number' && !isNaN(currentSocPrecise)) {
+        payload.soc = currentSocPrecise;
+      }
+      if (typeof smoothedSpeedKmh === 'number' && !isNaN(smoothedSpeedKmh)) {
+        // smoothedSpeedKmh is km/h; the abrp-proxy Worker expects m/s (it
+        // multiplies by 3.6 itself before forwarding to ABRP).
+        payload.speed = smoothedSpeedKmh / 3.6;
+      }
+      if (lastPos) {
+        payload.lat = lastPos.lat;
+        payload.lon = lastPos.lon;
+      }
+      // No OBD2/charger signal exists in this app, and telemetry only ever
+      // runs during an active driving trip — never mid-charge.
+      payload.is_charging = false;
+
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).then((res) => {
+        if (res.ok) {
+          setAbrpPushStatus('ok');
+        } else {
+          setAbrpPushStatus('failed');
+          console.warn('ABRP push: proxy returned', res.status);
+        }
+      }).catch((e) => {
+        setAbrpPushStatus('failed');
+        console.warn('ABRP push: request failed', e);
+      });
     } catch (e) {
+      setAbrpPushStatus('failed');
       console.warn('ABRP push: unexpected error', e);
     }
   }
@@ -7429,10 +7472,11 @@
     const shouldRun = tripActive && loadAbrpPushEnabled() && !!loadAbrpProxyUrl();
     if (shouldRun && abrpPushIntervalId === null) {
       abrpPushIntervalId = setInterval(sendAbrpTelemetry, ABRP_PUSH_INTERVAL_MS);
-      sendAbrpTelemetry(); // push once immediately rather than waiting 8s for the first fix
+      sendAbrpTelemetry(); // push once immediately rather than waiting 10s for the first fix
     } else if (!shouldRun && abrpPushIntervalId !== null) {
       clearInterval(abrpPushIntervalId);
       abrpPushIntervalId = null;
+      setAbrpPushStatus('idle');
     }
   }
 
@@ -7446,6 +7490,7 @@
       abrpPushToggle.setAttribute('aria-checked', String(enabled));
     }
     if (abrpProxyUrlInput) abrpProxyUrlInput.value = loadAbrpProxyUrl();
+    if (!enabled || !tripActive) setAbrpPushStatus('idle');
   }
 
   if (abrpPushToggle) {

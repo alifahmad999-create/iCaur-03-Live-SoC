@@ -1,4 +1,4 @@
 name = "abrp-proxy"
-main = "index.js"
+main = "src/index.js"
 compatibility_date = "2026-07-03"
 preview_urls = false
